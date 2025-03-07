@@ -1,7 +1,9 @@
 package main
 
 import (
+    "bytes"
     "context"
+    "encoding/json"
     "log"
     "net/http"
     "os"
@@ -10,13 +12,16 @@ import (
     "github.com/aws/aws-sdk-go-v2/config"
     "github.com/aws/aws-sdk-go-v2/service/dynamodb"
     "github.com/aws/aws-sdk-go-v2/service/dynamodb/types"
+    "github.com/aws/aws-sdk-go-v2/service/s3"
     "github.com/gin-gonic/gin"
 )
 
 var (
-    region       = os.Getenv("AWS_REGION")
-    dynamoClient *dynamodb.Client
-    ctx          = context.Background()
+    region           = os.Getenv("AWS_REGION")
+    dynamoClient     *dynamodb.Client
+    s3Client         *s3.Client
+    s3AccessPointARN = os.Getenv("S3_ACCESS_POINT_ARN") 
+    ctx              = context.Background()
 )
 
 type Order struct {
@@ -26,11 +31,12 @@ type Order struct {
 }
 
 func init() {
-    cfg, err := config.LoadDefaultConfig(context.TODO(), config.WithRegion(region))
+    cfg, err := config.LoadDefaultConfig(ctx, config.WithRegion(region))
     if err != nil {
         log.Fatalf("unable to load SDK config, %v", err)
     }
     dynamoClient = dynamodb.NewFromConfig(cfg)
+    s3Client = s3.NewFromConfig(cfg)
 }
 
 func main() {
@@ -38,6 +44,7 @@ func main() {
 
     router.GET("/v1/order", getOrder)
     router.POST("/v1/order", createOrder)
+    router.POST("/v1/s3/order", saveOrdersToS3)
 
     router.Run(":8080")
 }
@@ -67,7 +74,8 @@ func createOrder(c *gin.Context) {
         return
     }
 
-    if err := saveOrderToDynamoDB(&order); err != nil {
+    if err := saveOrderToDynamoDB(&order); 
+    err != nil {
         log.Printf("Failed to save order to DynamoDB for orderID %s: %v", order.ID, err)
         c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to save order"})
         return
@@ -76,11 +84,36 @@ func createOrder(c *gin.Context) {
     c.JSON(http.StatusCreated, gin.H{"message": "Order created successfully"})
 }
 
+func saveOrdersToS3(c *gin.Context) {
+    orders, err := getAllOrdersFromDynamoDB()
+    if err != nil {
+        log.Printf("Failed to fetch orders from DynamoDB: %v", err)
+        c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to fetch orders"})
+        return
+    }
+
+    data, err := json.Marshal(orders)
+    if err != nil {
+        log.Printf("Failed to marshal orders: %v", err)
+        c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to marshal orders"})
+        return
+    }
+
+    err = saveDataToS3(data)
+    if err != nil {
+        log.Printf("Failed to save data to S3: %v", err)
+        c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to save data to S3"})
+        return
+    }
+
+    c.JSON(http.StatusOK, gin.H{"message": "Orders saved to S3 successfully"})
+}
+
 func getOrderFromDynamoDB(orderID string) (*Order, error) {
     result, err := dynamoClient.GetItem(ctx, &dynamodb.GetItemInput{
         TableName: aws.String("order"),
-        Key: map[string]types.AttributeValue{
-            "id": &types.AttributeValueMemberS{ 
+        Key: map[string]types.AttributeValue{ 
+            "id": &types.AttributeValueMemberS{
                 Value: orderID,
             },
         },
@@ -91,7 +124,7 @@ func getOrderFromDynamoDB(orderID string) (*Order, error) {
     }
 
     if result.Item == nil {
-        return nil, nil
+        return nil, nil 
     }
 
     var order Order
@@ -108,6 +141,7 @@ func getOrderFromDynamoDB(orderID string) (*Order, error) {
     return &order, nil
 }
 
+// saveOrderToDynamoDB 함수 추가
 func saveOrderToDynamoDB(order *Order) error {
     input := &dynamodb.PutItemInput{
         TableName: aws.String("order"),
@@ -133,3 +167,48 @@ func saveOrderToDynamoDB(order *Order) error {
     log.Printf("Successfully saved order to DynamoDB for orderID %s", order.ID)
     return nil
 }
+
+func getAllOrdersFromDynamoDB() ([]Order, error) {
+    var orders []Order
+    result, err := dynamoClient.Scan(ctx, &dynamodb.ScanInput{
+        TableName: aws.String("order"),
+    })
+    if err != nil {
+        return nil, err
+    }
+
+    for _, item := range result.Items {
+        var order Order
+        if id, ok := item["id"].(*types.AttributeValueMemberS); ok {
+            order.ID = id.Value
+        }
+        if customerID, ok := item["customerid"].(*types.AttributeValueMemberS); ok {
+            order.CustomerID = customerID.Value
+        }
+        if productID, ok := item["productid"].(*types.AttributeValueMemberS); ok {
+            order.ProductID = productID.Value
+        }
+        orders = append(orders, order)
+    }
+
+    return orders, nil
+}
+
+func saveDataToS3(data []byte) error {
+    objectKey := "orders_data.json"
+
+    // S3에 데이터를 저장
+    _, err := s3Client.PutObject(ctx, &s3.PutObjectInput{
+        Bucket: aws.String(s3AccessPointARN), // 환경변수에서 가져온 ARN 사용
+        Key:    aws.String(objectKey),
+        Body:   bytes.NewReader(data),
+    })
+    if err != nil {
+        log.Printf("Error saving data to S3: %v", err)
+        return err
+    }
+
+    log.Printf("Successfully saved data to S3")
+    return nil
+}
+
