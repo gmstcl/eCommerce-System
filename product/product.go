@@ -8,6 +8,7 @@ import (
     "log"
     "net/http"
     "os"
+    "time"
 
     "github.com/aws/aws-sdk-go-v2/config"
     "github.com/aws/aws-sdk-go-v2/service/rdsdata"
@@ -28,8 +29,8 @@ var (
     mysqlHost     = os.Getenv("MYSQL_HOST")
     mysqlPort     = os.Getenv("MYSQL_PORT")
     mysqlDbName   = os.Getenv("MYSQL_DBNAME")
-    redisAddr     = os.Getenv("REDIS_HOST")
-    redisPort     = os.Getenv("REDIS_PORT")
+    redisHost     = os.Getenv("REDIS_HOST")
+    redisUseTLS   = os.Getenv("REDIS_USE_TLS") == "true"
     region        = os.Getenv("REGION")
 )
 
@@ -46,11 +47,23 @@ func init() {
     }
     rdsClient = rdsdata.NewFromConfig(cfg)
 
-    redisClient = redis.NewClient(&redis.Options{
-        Addr:     fmt.Sprintf("%s:%s", redisAddr, redisPort),
-        TLSConfig: &tls.Config{},  
-    })
+    var redisOptions *redis.Options
+    commonOptions := &redis.Options{
+        Addr:         fmt.Sprintf("%s:6379", redisHost),
+        DB:           0,
+        DialTimeout:  30 * time.Second,
+        ReadTimeout:  30 * time.Second,
+        WriteTimeout: 30 * time.Second,
+        PoolSize:     20,
+        MinIdleConns: 5,
+        MaxRetries:   3,
+    }
+    if redisUseTLS {
+        commonOptions.TLSConfig = &tls.Config{InsecureSkipVerify: true}
+    }
+    redisOptions = commonOptions
 
+    redisClient = redis.NewClient(redisOptions)
     checkRedisConnection()
 }
 
@@ -181,3 +194,4 @@ func saveToDB(product *Product) error {
     log.Printf("Successfully saved to DB for productID %s", product.ID)
     return nil
 }
+
